@@ -1,10 +1,15 @@
 name: Build
 
 # Polls upstream 3x-ui for a new release. When one appears:
-#   prepare  check out that tag, remove sponsored content, test the DNS guard
-#   build    one job per platform on a native runner: build, push by digest,
-#            pull that exact digest back and smoke-test it
-#   publish  combine the digests under the version tags, verify them, release
+#   prepare         check out that tag, remove sponsored content, point installs and
+#                   updates at this repo, test the DNS guard, build the web UI once
+#   build           one job per platform on a native runner:
+#                   - Docker image: build, push by digest, pull that digest back, smoke-test it
+#                   - native tarball (for systemd installs): static binary in upstream's
+#                     exact layout, compared with upstream's own tarball, smoke-tested
+#   publish         tag the multi-platform images, verify them, create a pre-release
+#   verify-install  fresh install + update from the pre-release on real amd64/arm64 VMs
+#   promote         mark the release as latest, so panels' Update button offers it
 
 on:
   schedule:
@@ -32,6 +37,8 @@ concurrency:
 env:
   UPSTREAM: MHSanaei/3x-ui
   IMAGE_NAME: 3x-ui   # ghcr.io/<owner>/3x-ui and <dockerhub-user>/3x-ui
+  # Download URLs of upstream's updater; none may survive in what we ship.
+  UPSTREAM_DOWNLOADS: 'raw\.githubusercontent\.com/mhsanaei/3x-ui/|api\.github\.com/repos/mhsanaei/3x-ui/|github\.com/mhsanaei/3x-ui/releases'
 
 jobs:
   check:
@@ -71,7 +78,7 @@ jobs:
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       TAG: ${{ needs.check.outputs.tag }}
     outputs:
@@ -92,7 +99,7 @@ jobs:
         run: |
           set -o pipefail
           { echo '### Sponsor removal'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          python3 remove-sponsors.py src | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 remove-sponsors.py src --repo "$GITHUB_REPOSITORY" | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           mkdir -p out
           git -C src add -A
@@ -124,13 +131,36 @@ jobs:
             echo "::warning::Upstream changes since $prev mention ads/sponsors, review them (see job summary)"
           fi
 
+      # The native binaries embed the web UI (go:embed), so it's built once here.
+      # Same Node image as upstream's Dockerfile frontend stage.
+      - name: Build web UI for native binaries
+        run: |
+          set -euo pipefail
+          node_img=$(sed -nE 's/^FROM[[:space:]]+(--platform=[^[:space:]]+[[:space:]]+)?(node:[^[:space:]]+).*/\2/p' src/Dockerfile | head -1)
+          [[ -n $node_img ]] || { echo "::error::no node image in upstream Dockerfile"; exit 1; }
+          echo "Using $node_img"
+          # Built in a copy so the source the Docker build sees stays untouched.
+          mkdir fe && tar -C src --exclude=.git -cf - . | tar -C fe -xf -
+          docker run --rm -v "$PWD/fe:/src" -w /src/frontend "$node_img" sh -euc 'npm ci --no-audit --no-fund && npm run build'
+          test -f fe/internal/web/dist/index.html
+          tar -C fe/internal/web -czf out/dist.tgz dist
+          sudo rm -rf fe
+
       # A tarball keeps file modes (DockerInit.sh must stay executable); artifacts don't.
-      - name: Package patched source
+      - name: Package patched source and release scripts
         id: pack
         run: |
+          set -euo pipefail
           echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           tar -C src --exclude=.git -czf out/source.tgz .
-          ls -lh out
+          # Fetched by install.sh / update.sh / x-ui.sh from this repo's releases.
+          mkdir out/scripts
+          cp src/install.sh src/update.sh src/x-ui.sh src/x-ui.rc src/x-ui.service.debian src/x-ui.service.arch src/x-ui.service.rhel out/scripts/
+          if grep -qiE "$UPSTREAM_DOWNLOADS" out/scripts/*; then
+            grep -niE "$UPSTREAM_DOWNLOADS" out/scripts/*
+            echo "::error::release scripts still download from upstream"; exit 1
+          fi
+          ls -lh out out/scripts
 
       - uses: actions/upload-artifact@v7
         with:
@@ -145,16 +175,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { platform: linux/amd64,    runner: ubuntu-24.04 }
-          - { platform: linux/386,      runner: ubuntu-24.04 }
-          - { platform: linux/arm64/v8, runner: ubuntu-24.04-arm }
-          - { platform: linux/arm/v7,   runner: ubuntu-24.04-arm }
-          - { platform: linux/arm/v6,   runner: ubuntu-24.04-arm }
+          # arch: upstream's tarball/binary naming; xray: Xray-core's zip naming
+          - { platform: linux/amd64,    arch: amd64, xray: 64,         runner: ubuntu-24.04 }
+          - { platform: linux/386,      arch: '386', xray: 32,         runner: ubuntu-24.04 }
+          - { platform: linux/arm64/v8, arch: arm64, xray: arm64-v8a,  runner: ubuntu-24.04-arm }
+          - { platform: linux/arm/v7,   arch: armv7, xray: arm32-v7a,  runner: ubuntu-24.04-arm }
+          - { platform: linux/arm/v6,   arch: armv6, xray: arm32-v6,   runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120   # native builds take minutes; this only matters if QEMU fallback kicks in
     env:
       TAG: ${{ needs.check.outputs.tag }}
       PLATFORM: ${{ matrix.platform }}
+      ARCH: ${{ matrix.arch }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/download-artifact@v8
@@ -249,21 +281,118 @@ jobs:
           curl -fsS -o /dev/null http://127.0.0.1:2053/ && echo "panel login page OK"
           docker rm -f nosponsor-smoke
 
-      # The frontend is embedded in the binary, so this covers backend and UI.
-      - name: Scan binary for blocked domains
+      - name: Copy binary out of the image
         env:
           IMAGE: ${{ steps.prep.outputs.ghcr }}@${{ steps.push.outputs.digest }}
         run: |
-          set -euo pipefail
           cid=$(docker create --platform "$PLATFORM" "$IMAGE")
-          docker cp "$cid:/app/x-ui" x-ui-bin
+          docker cp "$cid:/app/x-ui" image-x-ui
           docker rm "$cid"
-          found=$(grep -aoiE '([a-z0-9-]+\.)*sanaei\.dev' x-ui-bin | tr A-Z a-z | sort -u || true)
-          echo "sanaei.dev hosts in binary: ${found:-none}"
-          bad=$(echo "$found" | grep -vxE 'sanaei\.dev|docs\.sanaei\.dev|donate\.sanaei\.dev' | grep . || true)
-          [[ -z $bad ]] || { echo "::error::Unexpected hosts in binary: $bad"; exit 1; }
-          grep -q 'internal/nosponsor' x-ui-bin || { echo "::error::DNS guard missing from binary"; exit 1; }
-          echo "DNS guard present"
+
+      # Static (musl) binary, like upstream's release tarballs: runs on any Linux distro.
+      # Same Go image as upstream's Dockerfile builder stage, run natively for this platform.
+      - name: Build native binary
+        run: |
+          set -euo pipefail
+          tar -xzf dist.tgz -C src/internal/web
+          go_img=$(sed -nE 's/^FROM[[:space:]]+(--platform=[^[:space:]]+[[:space:]]+)?(golang:[^[:space:]]+).*/\2/p' src/Dockerfile | head -1)
+          [[ -n $go_img ]] || { echo "::error::no golang image in upstream Dockerfile"; exit 1; }
+          echo "Using $go_img"
+          docker run --rm --platform "$PLATFORM" -v "$PWD/src:/src" -w /src \
+            -e CGO_ENABLED=1 -e CGO_CFLAGS=-D_LARGEFILE64_SOURCE "$go_img" sh -euc '
+              apk add --no-cache build-base >/dev/null
+              go build -buildvcs=false -ldflags "-w -s -linkmode external -extldflags -static" -o xui-release .'
+          sudo chown "$(id -u):$(id -g)" src/xui-release
+          file src/xui-release
+          file src/xui-release | grep -q 'statically linked' || { echo "::error::binary is not static"; exit 1; }
+
+      # Mirrors upstream's release.yml packaging; compared with upstream's own tarball below.
+      - name: Package native tarball
+        env:
+          XRAY_ZIP: Xray-linux-${{ matrix.xray }}.zip
+        run: |
+          set -euo pipefail
+          fetch() { curl -fsSLR --retry 5 --retry-delay 3 "$@"; }
+          xray_ver=$(grep -ohE 'Xray-core/releases/download/v[0-9][0-9.]*' src/.github/workflows/release.yml src/DockerInit.sh | head -1 | sed 's#.*/##')
+          [[ -n $xray_ver ]] || { echo "::error::Xray version not found in upstream release.yml"; exit 1; }
+          echo "Xray $xray_ver"
+          mkdir -p pkg/x-ui/bin
+          cp src/xui-release pkg/x-ui/x-ui
+          cp src/x-ui.service.debian src/x-ui.service.arch src/x-ui.service.rhel src/x-ui.sh pkg/x-ui/
+          cd pkg/x-ui/bin
+          fetch -O "https://github.com/XTLS/Xray-core/releases/download/$xray_ver/$XRAY_ZIP"
+          unzip -q "$XRAY_ZIP" && rm -f "$XRAY_ZIP" geoip.dat geosite.dat
+          fetch -O https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+          fetch -O https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+          fetch -o geoip_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat
+          fetch -o geosite_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat
+          fetch -o geoip_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
+          fetch -o geosite_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
+          mv xray "xray-linux-$ARCH"
+          mtg_ver=$(curl -fsS --retry 5 -o /dev/null -w '%{redirect_url}' https://github.com/mhsanaei/mtg-multi/releases/latest | sed -n 's#.*/releases/tag/##p')
+          [[ -n $mtg_ver ]] || { echo "::error::could not resolve mtg-multi release"; exit 1; }
+          mtg_pkg="mtg-multi-${mtg_ver#v}-linux-$ARCH"
+          fetch -O "https://github.com/mhsanaei/mtg-multi/releases/download/$mtg_ver/$mtg_pkg.tar.gz"
+          tar -xzf "$mtg_pkg.tar.gz" && mv "$mtg_pkg/mtg-multi" "mtg-linux-$ARCH" && rm -rf "$mtg_pkg" "$mtg_pkg.tar.gz"
+          cd ..
+          if grep -qiE "$UPSTREAM_DOWNLOADS" x-ui.sh; then echo "::error::x-ui.sh still downloads from upstream"; exit 1; fi
+          cd ..
+          tar -zcf "../x-ui-linux-$ARCH.tar.gz" x-ui
+          cd ..
+          sha256sum "x-ui-linux-$ARCH.tar.gz" | tee "x-ui-linux-$ARCH.tar.gz.sha256"
+
+      # update.sh replaces the whole folder, so a missing file would vanish from servers.
+      - name: Compare with upstream's tarball
+        run: |
+          set -euo pipefail
+          url="https://github.com/$UPSTREAM/releases/download/$TAG/x-ui-linux-$ARCH.tar.gz"
+          if ! curl -fsSL --retry 5 -o upstream.tar.gz "$url"; then
+            echo "::warning::upstream has no x-ui-linux-$ARCH.tar.gz for $TAG, skipping comparison"; exit 0
+          fi
+          diff <(tar -tzf upstream.tar.gz | sed 's#/$##' | sort) <(tar -tzf "x-ui-linux-$ARCH.tar.gz" | sed 's#/$##' | sort) \
+            && echo "Same file list as upstream's tarball" \
+            || { echo "::error::file list differs from upstream's x-ui-linux-$ARCH.tar.gz (< upstream, > ours)"; exit 1; }
+          mkdir up && tar -xzf upstream.tar.gz -C up
+          a=$(up/x-ui/bin/xray-linux-$ARCH version | head -1); b=$(pkg/x-ui/bin/xray-linux-$ARCH version | head -1)
+          echo "upstream: $a"; echo "ours:     $b"
+          [[ $a == "$b" ]] || echo "::warning::Xray version differs from upstream's tarball"
+          echo "upstream x-ui: $(up/x-ui/x-ui -v), ours: $(pkg/x-ui/x-ui -v)"
+
+      - name: Smoke test native tarball
+        run: |
+          set -euo pipefail
+          mkdir t && tar -xzf "x-ui-linux-$ARCH.tar.gz" -C t
+          cd t/x-ui
+          [[ $(./x-ui -v) == "${TAG#v}" ]] || { echo "::error::version $(./x-ui -v) != ${TAG#v}"; exit 1; }
+          sudo env XUI_DB_FOLDER="$PWD/../db" XUI_LOG_FOLDER="$PWD/../log" XUI_BIN_FOLDER="$PWD/bin" \
+            "$PWD/x-ui" > ../run.log 2>&1 &
+          for i in $(seq 60); do
+            body=$(curl -fsS http://127.0.0.1:2053/sponsors 2>/dev/null) && break
+            sleep 2
+          done
+          tail -20 ../run.log
+          echo "GET /sponsors -> ${body:-<no response>}"
+          echo "$body" | jq -e '.success == true and (.obj.sponsors | length) == 0'
+          curl -fsS -o /dev/null http://127.0.0.1:2053/ && echo "panel login page OK"
+          sudo pkill -f "^$PWD/" || true
+
+      # The frontend is embedded in the binary, so this covers backend and UI.
+      - name: Scan binaries
+        run: |
+          set -euo pipefail
+          for bin in image-x-ui pkg/x-ui/x-ui; do
+            echo "== $bin"
+            found=$(grep -aoiE '([a-z0-9-]+\.)*sanaei\.dev' "$bin" | tr '[:upper:]' '[:lower:]' | sort -u || true)
+            echo "sanaei.dev hosts: $(echo $found)"
+            bad=$(echo "$found" | grep -vxE 'sanaei\.dev|docs\.sanaei\.dev|donate\.sanaei\.dev' | grep . || true)
+            [[ -z $bad ]] || { echo "::error::$bin: unexpected hosts: $bad"; exit 1; }
+            grep -q 'internal/nosponsor' "$bin" || { echo "::error::$bin: DNS guard missing"; exit 1; }
+            echo "DNS guard present"
+            if grep -aoiE "$UPSTREAM_DOWNLOADS" "$bin"; then echo "::error::$bin: updater still points at upstream"; exit 1; fi
+            grep -aq "github.com/$GITHUB_REPOSITORY/releases/latest/download/update.sh" "$bin" \
+              || { echo "::error::$bin: updater does not point at $GITHUB_REPOSITORY"; exit 1; }
+            echo "Updater points at $GITHUB_REPOSITORY"
+          done
 
       - name: Export digest
         env:
@@ -276,6 +405,13 @@ jobs:
           path: digests/*
           if-no-files-found: error
           retention-days: 1
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: x-ui-linux-${{ matrix.arch }}.tar.gz*
+          if-no-files-found: error
+          retention-days: 7
 
   publish:
     needs: [check, prepare, build]
@@ -293,14 +429,21 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
+          pattern: tarball-*
+          path: assets
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v8
+        with:
           name: prepared
           path: prepared
 
       - name: Image names
         id: names
         run: |
-          ls digests
+          ls digests assets
           [[ $(ls digests | wc -l) == 5 ]] || { echo "::error::expected 5 platform digests"; exit 1; }
+          [[ $(ls assets/*.tar.gz | wc -l) == 5 ]] || { echo "::error::expected 5 native tarballs"; exit 1; }
           echo "ghcr=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
           [[ -z $DOCKERHUB_USERNAME ]] || echo "dockerhub=${DOCKERHUB_USERNAME,,}/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
 
@@ -374,36 +517,127 @@ jobs:
             [[ $code == 200 ]] && echo "ok  Docker Hub anonymous pull" || echo "::warning::Docker Hub anonymous pull failed (HTTP $code)"
           fi
 
-      - name: Create release
+      # Created as a pre-release: panels' Update button and `x-ui update` only follow
+      # the latest full release, so nothing reaches servers before verify-install passes.
+      - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}
-          LATEST: ${{ needs.check.outputs.latest }}
           SHA: ${{ needs.prepare.outputs.sha }}
           GHCR: ${{ steps.names.outputs.ghcr }}
           DOCKERHUB: ${{ steps.names.outputs.dockerhub }}
           DIGEST: ${{ steps.verify.outputs.digest }}
         run: |
           set -euo pipefail
+          dl="https://github.com/$GITHUB_REPOSITORY/releases/latest/download"
           {
             echo "3x-ui [\`$TAG\`](https://github.com/$UPSTREAM/releases/tag/$TAG) with sponsored content removed."
             echo
             echo "Upstream commit: [\`${SHA:0:8}\`](https://github.com/$UPSTREAM/commit/$SHA)"
             echo
+            echo "### Docker"
             echo '```'
             echo "docker pull $GHCR:${TAG#v}"
             [[ -z $DOCKERHUB ]] || echo "docker pull $DOCKERHUB:${TAG#v}"
             echo '```'
-            echo
             echo "Digest: \`$DIGEST\`"
             echo
-            echo "Platforms: \`linux/amd64, linux/arm64, linux/arm/v7, linux/arm/v6, linux/386\` (each smoke-tested on its own architecture)"
+            echo "### Native install (systemd)"
+            echo "Switch an existing 3x-ui install to this build (keeps the database and settings):"
+            echo '```'
+            echo "bash <(curl -Ls $dl/update.sh)"
+            echo '```'
+            echo "Fresh install:"
+            echo '```'
+            echo "bash <(curl -Ls $dl/install.sh)"
+            echo '```'
+            echo "After either, the panel's Update button and \`x-ui update\` install future builds from this repo."
+            echo
+            echo "Platforms: \`amd64, arm64, armv7, armv6, 386\`, each built and smoke-tested natively on its own architecture."
             echo
             echo "The exact source changes are attached as \`nosponsor-$TAG.diff\`."
             [[ ! -f prepared/watch.md ]] || { echo; cat prepared/watch.md; }
           } > notes.md
           gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" "prepared/nosponsor-$TAG.diff" -R "$GITHUB_REPOSITORY" \
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --prerelease \
+            assets/* prepared/scripts/* "prepared/nosponsor-$TAG.diff" \
             --title "3x-ui $TAG (no sponsors)" \
             --notes-file notes.md \
-            --target "$GITHUB_SHA" \
-            --latest="$LATEST"
+            --target "$GITHUB_SHA"
+
+  # Real installs on throwaway VMs with systemd, downloading only from the pre-release.
+  verify-install:
+    needs: [check, publish]
+    name: verify-install (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      BASE: ci-check-path
+    steps:
+      - name: Fresh install with this release's install.sh
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh" -o install.sh
+          sudo XUI_NONINTERACTIVE=1 XUI_USERNAME=ci XUI_PASSWORD="ci-$RANDOM$RANDOM" XUI_PANEL_PORT=2053 \
+            XUI_WEB_BASE_PATH="$BASE" XUI_SSL_MODE=none bash install.sh "$TAG" < /dev/null 2>&1 | tail -40
+
+      - name: Check installed panel
+        run: |
+          cat > check.sh <<'SH'
+          set -euo pipefail
+          systemctl is-active x-ui
+          v=$(/usr/local/x-ui/x-ui -v); echo "x-ui $v"; [[ $v == "${TAG#v}" ]]
+          for i in $(seq 30); do
+            body=$(curl -fsS "http://127.0.0.1:2053/$BASE/sponsors" 2>/dev/null) && break
+            sleep 2
+          done
+          echo "GET /$BASE/sponsors -> ${body:-<no response>}"
+          echo "$body" | jq -e '.success == true and (.obj.sponsors | length) == 0'
+          # The installed CLI and panel binary must update from this repo, never upstream.
+          if grep -niE "$UPSTREAM_DOWNLOADS" /usr/bin/x-ui; then echo "::error::/usr/bin/x-ui downloads from upstream"; exit 1; fi
+          grep -q "github.com/$GITHUB_REPOSITORY/releases" /usr/bin/x-ui
+          grep -aq "github.com/$GITHUB_REPOSITORY/releases/latest/download/update.sh" /usr/local/x-ui/x-ui
+          echo "CLI and panel updater point at $GITHUB_REPOSITORY"
+          SH
+          bash check.sh
+
+      # The same path as the panel's Update button / `x-ui update` on an existing server.
+      - name: Update with this release's update.sh
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/update.sh" -o update.sh
+          sudo XUI_UPDATE_TAG="$TAG" bash update.sh < /dev/null 2>&1 | tail -30
+
+      - name: Check panel after update
+        run: bash check.sh
+
+  promote:
+    needs: [check, verify-install]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      LATEST: ${{ needs.check.outputs.latest }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Mark release as ready
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease=false --latest="$LATEST"
+          if [[ $LATEST == true ]]; then
+            for i in $(seq 10); do
+              got=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name 2>/dev/null || true)
+              [[ $got == "$TAG" ]] && break
+              sleep 3
+            done
+            [[ $got == "$TAG" ]] || { echo "::error::latest release is $got, want $TAG"; exit 1; }
+            code=$(curl -s -o /dev/null -w '%{http_code}' -L "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/update.sh")
+            [[ $code == 200 ]] || { echo "::error::latest/download/update.sh returned HTTP $code"; exit 1; }
+            echo "$TAG is the latest release; panels' Update button will now offer it"
+          fi

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Remove sponsored content from a 3x-ui source tree.
 
-Usage: python3 remove-sponsors.py <path-to-3x-ui-source>
+Usage: python3 remove-sponsors.py <path-to-3x-ui-source> [--repo OWNER/NAME]
 
 Layers, from most generic (survives upstream rewrites) to most specific:
 
@@ -14,11 +14,15 @@ Layers, from most generic (survives upstream rewrites) to most specific:
    sponsor/advert/promo renders nothing, including ones upstream adds later.
 4. Known code: the sponsor API always returns an empty list, and the Sponsors
    page is removed from the menu, routes and command palette.
+5. Updates (with --repo): the panel's Update button and version check, and the
+   install.sh / update.sh / x-ui.sh scripts, download from OWNER/NAME's GitHub
+   releases instead of upstream's, so updating can't bring the ads back.
 
 Any change upstream makes that this script can't recognise fails the run
 (ERROR) instead of silently shipping ads. Cosmetic misses only WARN.
 """
 
+import argparse
 import re
 import shutil
 import sys
@@ -29,8 +33,13 @@ LINK_ALLOWLIST = {"docs.sanaei.dev", "donate.sanaei.dev"}  # href links only, ne
 AD_PATH = re.compile(r"sponsor|advert|promo", re.I)
 SKIP_FILE = re.compile(r"(_test\.go|\.test\.tsx?|\.spec\.tsx?|\.stories\.tsx?)$")
 
+args = argparse.ArgumentParser(description="Remove sponsored content from a 3x-ui source tree.")
+args.add_argument("root", nargs="?", default=".", help="3x-ui source directory")
+args.add_argument("--repo", help="OWNER/NAME whose GitHub releases installs and updates come from")
+args = args.parse_args()
+
 here = Path(__file__).resolve().parent
-root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+root = Path(args.root).resolve()
 errors, warnings = [], []
 
 
@@ -160,6 +169,48 @@ def known_frontend():
         rewrite(p, lambda s: (re.sub(r"^[ \t]*CrownOutlined,\n", "", s, flags=re.M), None))
 
 
+# --- 5. Updates come from this repo ----------------------------------------
+UPDATE_SCRIPTS = ("install.sh", "update.sh", "x-ui.sh")
+# Script/asset fetches from upstream. Plain links (repo page, wiki, docs) are left alone.
+RAW = re.compile(r"https://raw\.githubusercontent\.com/mhsanaei/3x-ui/([^/\s\"'`]+)/([\w.${}-]+)", re.I)
+RELEASES = re.compile(r"https://github\.com/mhsanaei/3x-ui/releases\b", re.I)
+API = re.compile(r"https://api\.github\.com/repos/mhsanaei/3x-ui/", re.I)
+
+
+def repoint(s, repo):
+    def raw(m):
+        ref, name = m.groups()
+        if ref in ("main", "master"):  # "the current scripts" -> the latest release's copy
+            return f"https://github.com/{repo}/releases/latest/download/{name}"
+        return f"https://github.com/{repo}/releases/download/{ref}/{name}"  # pinned to a tag
+    s, a = RAW.subn(raw, s)
+    s, b = RELEASES.subn(f"https://github.com/{repo}/releases", s)
+    s, c = API.subn(f"https://api.github.com/repos/{repo}/", s)
+    return s, a + b + c
+
+
+def repoint_updates(repo):
+    if not repo:
+        return log("WARN", "updates: no --repo given, installs and updates still come from upstream")
+    total = 0
+    for p in [root / f for f in UPDATE_SCRIPTS] + [p for p in source_files() if p.suffix == ".go"]:
+        if not p.exists():
+            log("ERROR", f"updates: {p.relative_to(root)} not found")
+            continue
+        n = 0
+
+        def fn(s):
+            nonlocal n
+            s, n = repoint(s, repo)
+            return s, None
+        rewrite(p, fn)
+        total += n
+        # These must change: a miss means upstream moved its updater somewhere this script doesn't know.
+        if n == 0 and (p.name in UPDATE_SCRIPTS or p.name == "panel.go"):
+            log("ERROR", f"updates: no upstream download URLs found in {p.relative_to(root)}")
+    log("ok", f"updates: {total} upstream download URL(s) now point at {repo} releases")
+
+
 # --- checks ----------------------------------------------------------------
 def final_checks():
     for p in source_files():
@@ -169,6 +220,10 @@ def final_checks():
                 log("ERROR", f"{p.relative_to(root)}: still references {m.group(1)}")
         if "net.DefaultResolver.Dial" in s or re.search(r"net\.DefaultResolver\s*=", s):
             log("ERROR", f"{p.relative_to(root)}: replaces the default resolver, the DNS guard may be bypassed")
+        if args.repo:
+            for rx in (RAW, RELEASES, API):
+                for m in rx.finditer(s):
+                    log("ERROR", f"{p.relative_to(root)}: still downloads from upstream: {m.group(0)}")
 
 
 install_guard()
@@ -176,6 +231,7 @@ scrub_urls()
 kill_components()
 known_backend()
 known_frontend()
+repoint_updates(args.repo)
 final_checks()
 
 print(f"\n{len(errors)} error(s), {len(warnings)} warning(s)")

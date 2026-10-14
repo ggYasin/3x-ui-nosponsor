@@ -10,10 +10,10 @@ A scheduled GitHub Action checks for a new upstream release every 3 hours. When 
 docker run -d --name 3x-ui --restart unless-stopped --network host \
   -v $PWD/db:/etc/x-ui \
   -v $PWD/cert:/root/cert \
-  ghcr.io/ggyasin/3x-ui-nosponsor:latest
+  ghcr.io/ggyasin/3x-ui:latest
 ```
 
-The image is also published to Docker Hub as `ggyasin/3x-ui-nosponsor`. Tags:
+The image is also published to Docker Hub as `ggyasin/3x-ui`. Tags:
 
 | Tag | Meaning |
 |---|---|

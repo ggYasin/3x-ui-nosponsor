@@ -29,6 +29,7 @@ concurrency:
 
 env:
   UPSTREAM: MHSanaei/3x-ui
+  IMAGE_NAME: 3x-ui   # ghcr.io/<owner>/3x-ui and <dockerhub-user>/3x-ui
   PLATFORMS: linux/amd64,linux/arm64/v8,linux/arm/v7,linux/arm/v6,linux/386
 
 jobs:
@@ -124,8 +125,8 @@ jobs:
       - name: Image names
         id: names
         run: |
-          echo "ghcr=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-          [[ -z $DOCKERHUB_USERNAME ]] || echo "dockerhub=${DOCKERHUB_USERNAME,,}/${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+          echo "ghcr=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          [[ -z $DOCKERHUB_USERNAME ]] || echo "dockerhub=${DOCKERHUB_USERNAME,,}/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Docker metadata
         id: meta

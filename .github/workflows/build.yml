@@ -1,0 +1,250 @@
+name: Build
+
+# Polls upstream 3x-ui for a new release. When one appears: check out that tag,
+# remove sponsored content, build the image, smoke-test it, push it, and create
+# a matching GitHub release in this repo.
+
+on:
+  schedule:
+    - cron: '17 */3 * * *'   # every 3 hours
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream tag to build (e.g. v3.10.0). Blank = latest release'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if this version was already released'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write    # create releases
+  packages: write    # push to ghcr.io
+  actions: write     # keep the schedule from being auto-disabled
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: MHSanaei/3x-ui
+  PLATFORMS: linux/amd64,linux/arm64/v8,linux/arm/v7,linux/arm/v6,linux/386
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      latest: ${{ steps.resolve.outputs.latest }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: Resolve upstream version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)
+          tag=${REQUESTED:-$latest}
+          [[ $tag == v* ]] || tag="v$tag"
+          gh api "repos/$UPSTREAM/git/ref/tags/$tag" --silent || { echo "Upstream tag $tag not found"; exit 1; }
+          build=true
+          if [[ $FORCE != true ]] && gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag already released, nothing to do"
+            build=false
+          fi
+          echo "Upstream latest: $latest, target: $tag, build: $build"
+          { echo "tag=$tag"; echo "latest=$([[ $tag == "$latest" ]] && echo true || echo false)"; echo "build=$build"; } >> "$GITHUB_OUTPUT"
+
+      # GitHub disables scheduled workflows after 60 days without repo activity.
+      - name: Keep schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/enable" || true
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out upstream ${{ env.TAG }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ env.TAG }}
+          path: src
+          submodules: true
+          persist-credentials: false
+
+      - name: Remove sponsored content
+        run: |
+          set -o pipefail
+          { echo '### Sponsor removal'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          python3 remove-sponsors.py src | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          git -C src add -A
+          git -C src diff --cached > nosponsor-${TAG}.diff
+          git -C src diff --cached --stat
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: src/go.mod
+          cache: false
+
+      - name: Test DNS guard
+        working-directory: src
+        run: go test -v ./internal/nosponsor/
+
+      # Not a gate: flag upstream changes that might add a new kind of ad for a human to look at.
+      - name: Watch upstream for new ad-related changes
+        id: watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          [[ -n $prev && $prev != "$TAG" ]] || { echo "No previous release to compare with"; exit 0; }
+          words='sponsor|advert|\bads?\b|promo|partner|banner|affiliate|donat'
+          hits=$(gh api "repos/$UPSTREAM/compare/$prev...$TAG" --jq \
+            '(.commits[] | "commit \(.sha[0:8]) \(.commit.message | split("\n")[0])"), (.files[]? | "file   \(.filename)")' \
+            | grep -iE "$words" || true)
+          if [[ -n $hits ]]; then
+            { echo "### ⚠️ Upstream changes since $prev mention ads/sponsors"; echo '```'; echo "$hits"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY" > watch.md
+            echo "::warning::Upstream changes since $prev mention ads/sponsors, review them (see job summary)"
+          fi
+
+      - name: Image names
+        id: names
+        run: |
+          echo "ghcr=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          [[ -z $DOCKERHUB_USERNAME ]] || echo "dockerhub=${DOCKERHUB_USERNAME,,}/${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ steps.names.outputs.ghcr }}
+            ${{ steps.names.outputs.dockerhub }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ env.TAG }}
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=raw,value=latest,enable=${{ needs.check.outputs.latest == 'true' }}
+          labels: |
+            org.opencontainers.image.title=3x-ui (no sponsors)
+            org.opencontainers.image.description=3x-ui ${{ env.TAG }} with sponsored content removed
+            org.opencontainers.image.version=${{ env.TAG }}
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build amd64 for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: src
+          load: true
+          platforms: linux/amd64
+          tags: nosponsor-test
+          cache-from: type=gha,scope=3x-ui
+          cache-to: type=gha,scope=3x-ui,mode=max
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker run -d --name t -p 2053:2053 nosponsor-test
+          for i in $(seq 60); do
+            body=$(curl -fsS http://127.0.0.1:2053/sponsors 2>/dev/null) && break
+            sleep 2
+          done
+          docker logs t | tail -20
+          echo "GET /sponsors -> ${body:-<no response>}"
+          echo "$body" | jq -e '.success == true and (.obj.sponsors | length) == 0'
+          curl -fsS -o /dev/null http://127.0.0.1:2053/ && echo "panel login page OK"
+          docker rm -f t
+
+      # The frontend is embedded in the binary, so this covers backend and UI.
+      - name: Scan binary for blocked domains
+        run: |
+          set -euo pipefail
+          cid=$(docker create nosponsor-test)
+          docker cp "$cid:/app/x-ui" x-ui-bin
+          docker rm "$cid"
+          found=$(grep -aoiE '([a-z0-9-]+\.)*sanaei\.dev' x-ui-bin | tr A-Z a-z | sort -u || true)
+          echo "sanaei.dev hosts in binary: ${found:-none}"
+          bad=$(echo "$found" | grep -vxE 'sanaei\.dev|docs\.sanaei\.dev|donate\.sanaei\.dev' | grep . || true)
+          [[ -z $bad ]] || { echo "::error::Unexpected hosts in binary: $bad"; exit 1; }
+          grep -q 'internal/nosponsor' x-ui-bin || { echo "::error::DNS guard missing from binary"; exit 1; }
+          echo "DNS guard present"
+          rm x-ui-bin
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push all platforms
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: src
+          push: true
+          platforms: ${{ env.PLATFORMS }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=3x-ui
+          cache-to: type=gha,scope=3x-ui,mode=max
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ needs.check.outputs.latest }}
+          GHCR: ${{ steps.names.outputs.ghcr }}
+          DOCKERHUB: ${{ steps.names.outputs.dockerhub }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          sha=$(git -C src rev-parse HEAD)
+          {
+            echo "3x-ui [\`$TAG\`](https://github.com/$UPSTREAM/releases/tag/$TAG) with sponsored content removed."
+            echo
+            echo "Upstream commit: [\`${sha:0:8}\`](https://github.com/$UPSTREAM/commit/$sha)"
+            echo
+            echo '```'
+            echo "docker pull $GHCR:${TAG#v}"
+            [[ -z $DOCKERHUB ]] || echo "docker pull $DOCKERHUB:${TAG#v}"
+            echo '```'
+            echo
+            echo "Digest: \`$DIGEST\`"
+            echo
+            echo "Platforms: \`$PLATFORMS\`"
+            echo
+            echo "The exact source changes are attached as \`nosponsor-$TAG.diff\`."
+            [[ ! -f watch.md ]] || { echo; cat watch.md; }
+          } > notes.md
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "nosponsor-$TAG.diff" \
+            --title "3x-ui $TAG (no sponsors)" \
+            --notes-file notes.md \
+            --target "$GITHUB_SHA" \
+            --latest="$LATEST"

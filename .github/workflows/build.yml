@@ -1,8 +1,10 @@
 name: Build
 
-# Polls upstream 3x-ui for a new release. When one appears: check out that tag,
-# remove sponsored content, build the image, smoke-test it, push it, and create
-# a matching GitHub release in this repo.
+# Polls upstream 3x-ui for a new release. When one appears:
+#   prepare  check out that tag, remove sponsored content, test the DNS guard
+#   build    one job per platform on a native runner: build, push by digest,
+#            pull that exact digest back and smoke-test it
+#   publish  combine the digests under the version tags, verify them, release
 
 on:
   schedule:
@@ -30,7 +32,6 @@ concurrency:
 env:
   UPSTREAM: MHSanaei/3x-ui
   IMAGE_NAME: 3x-ui   # ghcr.io/<owner>/3x-ui and <dockerhub-user>/3x-ui
-  PLATFORMS: linux/amd64,linux/arm64/v8,linux/arm/v7,linux/arm/v6,linux/386
 
 jobs:
   check:
@@ -66,14 +67,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/enable" || true
 
-  build:
+  prepare:
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 20
     env:
       TAG: ${{ needs.check.outputs.tag }}
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    outputs:
+      sha: ${{ steps.pack.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
 
@@ -92,11 +94,12 @@ jobs:
           { echo '### Sponsor removal'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           python3 remove-sponsors.py src | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p out
           git -C src add -A
-          git -C src diff --cached > nosponsor-${TAG}.diff
+          git -C src diff --cached > "out/nosponsor-$TAG.diff"
           git -C src diff --cached --stat
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: src/go.mod
           cache: false
@@ -107,7 +110,6 @@ jobs:
 
       # Not a gate: flag upstream changes that might add a new kind of ad for a human to look at.
       - name: Watch upstream for new ad-related changes
-        id: watch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -118,13 +120,187 @@ jobs:
             '(.commits[] | "commit \(.sha[0:8]) \(.commit.message | split("\n")[0])"), (.files[]? | "file   \(.filename)")' \
             | grep -iE "$words" || true)
           if [[ -n $hits ]]; then
-            { echo "### ⚠️ Upstream changes since $prev mention ads/sponsors"; echo '```'; echo "$hits"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY" > watch.md
+            { echo "### ⚠️ Upstream changes since $prev mention ads/sponsors"; echo '```'; echo "$hits"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY" > out/watch.md
             echo "::warning::Upstream changes since $prev mention ads/sponsors, review them (see job summary)"
           fi
+
+      # A tarball keeps file modes (DockerInit.sh must stay executable); artifacts don't.
+      - name: Package patched source
+        id: pack
+        run: |
+          echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          tar -C src --exclude=.git -czf out/source.tgz .
+          ls -lh out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prepared
+          path: out/
+          retention-days: 7
+
+  build:
+    needs: [check, prepare]
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64,    runner: ubuntu-24.04 }
+          - { platform: linux/386,      runner: ubuntu-24.04 }
+          - { platform: linux/arm64/v8, runner: ubuntu-24.04-arm }
+          - { platform: linux/arm/v7,   runner: ubuntu-24.04-arm }
+          - { platform: linux/arm/v6,   runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120   # native builds take minutes; this only matters if QEMU fallback kicks in
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      PLATFORM: ${{ matrix.platform }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: prepared
+
+      - name: Unpack source
+        id: prep
+        run: |
+          mkdir src && tar -xzf source.tgz -C src
+          echo "slug=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+          echo "ghcr=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          names="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$IMAGE_NAME"
+          if [[ -n $DOCKERHUB_USERNAME ]]; then
+            echo "dockerhub=${DOCKERHUB_USERNAME,,}/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+            names+=",${DOCKERHUB_USERNAME,,}/$IMAGE_NAME"
+          fi
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+
+      # Logged in first so base-image pulls aren't anonymous (rate limits).
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The runner should execute this platform natively. If it can't, fall back to QEMU (slow but correct).
+      - name: Check native execution
+        id: native
+        run: |
+          if docker run --rm --platform "$PLATFORM" alpine:3 uname -m; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::$PLATFORM can't run natively on ${{ matrix.runner }}, using QEMU (much slower)"
+          fi
+
+      - uses: docker/setup-qemu-action@v4
+        if: steps.native.outputs.ok != 'true'
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ steps.prep.outputs.ghcr }}
+            ${{ steps.prep.outputs.dockerhub }}
+          labels: |
+            org.opencontainers.image.title=3x-ui (no sponsors)
+            org.opencontainers.image.description=3x-ui ${{ env.TAG }} with sponsored content removed
+            org.opencontainers.image.version=${{ env.TAG }}
+
+      # Pushed untagged; nothing is visible under a tag until every platform passes.
+      - name: Build and push by digest
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: src
+          platforms: ${{ env.PLATFORM }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,"name=${{ steps.prep.outputs.names }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          # No build cache: upstream's Dockerfile copies the whole source before `go build`,
+          # so each new release invalidates the expensive layers anyway. Exporting a cache
+          # would only add an upload to the critical path to save ~1-2 min.
+
+      # Test the exact bytes that were pushed, on this platform.
+      - name: Smoke test
+        env:
+          IMAGE: ${{ steps.prep.outputs.ghcr }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull --platform "$PLATFORM" "$IMAGE"
+          docker run -d --name nosponsor-smoke --platform "$PLATFORM" -p 2053:2053 "$IMAGE"
+          for i in $(seq 90); do
+            body=$(curl -fsS http://127.0.0.1:2053/sponsors 2>/dev/null) && break
+            sleep 2
+          done
+          docker logs nosponsor-smoke 2>&1 | tail -20
+          echo "GET /sponsors -> ${body:-<no response>}"
+          echo "$body" | jq -e '.success == true and (.obj.sponsors | length) == 0'
+          curl -fsS -o /dev/null http://127.0.0.1:2053/ && echo "panel login page OK"
+          docker rm -f nosponsor-smoke
+
+      # The frontend is embedded in the binary, so this covers backend and UI.
+      - name: Scan binary for blocked domains
+        env:
+          IMAGE: ${{ steps.prep.outputs.ghcr }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cid=$(docker create --platform "$PLATFORM" "$IMAGE")
+          docker cp "$cid:/app/x-ui" x-ui-bin
+          docker rm "$cid"
+          found=$(grep -aoiE '([a-z0-9-]+\.)*sanaei\.dev' x-ui-bin | tr A-Z a-z | sort -u || true)
+          echo "sanaei.dev hosts in binary: ${found:-none}"
+          bad=$(echo "$found" | grep -vxE 'sanaei\.dev|docs\.sanaei\.dev|donate\.sanaei\.dev' | grep . || true)
+          [[ -z $bad ]] || { echo "::error::Unexpected hosts in binary: $bad"; exit 1; }
+          grep -q 'internal/nosponsor' x-ui-bin || { echo "::error::DNS guard missing from binary"; exit 1; }
+          echo "DNS guard present"
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: mkdir digests && touch "digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ steps.prep.outputs.slug }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [check, prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: prepared
+          path: prepared
 
       - name: Image names
         id: names
         run: |
+          ls digests
+          [[ $(ls digests | wc -l) == 5 ]] || { echo "::error::expected 5 platform digests"; exit 1; }
           echo "ghcr=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
           [[ -z $DOCKERHUB_USERNAME ]] || echo "dockerhub=${DOCKERHUB_USERNAME,,}/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
 
@@ -141,52 +317,8 @@ jobs:
             type=semver,pattern={{version}},value=${{ env.TAG }}
             type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
             type=raw,value=latest,enable=${{ needs.check.outputs.latest == 'true' }}
-          labels: |
-            org.opencontainers.image.title=3x-ui (no sponsors)
-            org.opencontainers.image.description=3x-ui ${{ env.TAG }} with sponsored content removed
-            org.opencontainers.image.version=${{ env.TAG }}
 
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
-
-      - name: Build amd64 for smoke test
-        uses: docker/build-push-action@v7
-        with:
-          context: src
-          load: true
-          platforms: linux/amd64
-          tags: nosponsor-test
-          cache-from: type=gha,scope=3x-ui
-          cache-to: type=gha,scope=3x-ui,mode=max
-
-      - name: Smoke test
-        run: |
-          set -euo pipefail
-          docker run -d --name nosponsor-smoke -p 2053:2053 nosponsor-test
-          for i in $(seq 60); do
-            body=$(curl -fsS http://127.0.0.1:2053/sponsors 2>/dev/null) && break
-            sleep 2
-          done
-          docker logs nosponsor-smoke | tail -20
-          echo "GET /sponsors -> ${body:-<no response>}"
-          echo "$body" | jq -e '.success == true and (.obj.sponsors | length) == 0'
-          curl -fsS -o /dev/null http://127.0.0.1:2053/ && echo "panel login page OK"
-          docker rm -f nosponsor-smoke
-
-      # The frontend is embedded in the binary, so this covers backend and UI.
-      - name: Scan binary for blocked domains
-        run: |
-          set -euo pipefail
-          cid=$(docker create nosponsor-test)
-          docker cp "$cid:/app/x-ui" x-ui-bin
-          docker rm "$cid"
-          found=$(grep -aoiE '([a-z0-9-]+\.)*sanaei\.dev' x-ui-bin | tr A-Z a-z | sort -u || true)
-          echo "sanaei.dev hosts in binary: ${found:-none}"
-          bad=$(echo "$found" | grep -vxE 'sanaei\.dev|docs\.sanaei\.dev|donate\.sanaei\.dev' | grep . || true)
-          [[ -z $bad ]] || { echo "::error::Unexpected hosts in binary: $bad"; exit 1; }
-          grep -q 'internal/nosponsor' x-ui-bin || { echo "::error::DNS guard missing from binary"; exit 1; }
-          echo "DNS guard present"
-          rm x-ui-bin
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -202,34 +334,60 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push all platforms
-        id: push
-        uses: docker/build-push-action@v7
-        with:
-          context: src
-          push: true
-          platforms: ${{ env.PLATFORMS }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha,scope=3x-ui
-          cache-to: type=gha,scope=3x-ui,mode=max
+      - name: Tag multi-platform images
+        env:
+          IMAGES: ${{ steps.names.outputs.ghcr }} ${{ steps.names.outputs.dockerhub }}
+        run: |
+          set -euo pipefail
+          for img in $IMAGES; do
+            tags=$(jq -r --arg p "$img:" '.tags[] | select(startswith($p)) | "-t " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+            docker buildx imagetools create $tags $(printf "$img@sha256:%s " $(ls digests))
+          done
+
+      - name: Verify published tags
+        id: verify
+        env:
+          IMAGES: ${{ steps.names.outputs.ghcr }} ${{ steps.names.outputs.dockerhub }}
+        run: |
+          set -euo pipefail
+          want='linux/386 linux/amd64 linux/arm/v6 linux/arm/v7 linux/arm64'
+          for ref in $(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON"); do
+            got=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' \
+              | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)\(if .variant and .architecture != "arm64" then "/" + .variant else "" end)"] | sort | join(" ")')
+            [[ $got == "$want" ]] || { echo "::error::$ref has [$got], want [$want]"; exit 1; }
+            echo "ok  $ref  [$got]"
+          done
+          echo "digest=$(docker buildx imagetools inspect "${{ steps.names.outputs.ghcr }}:${TAG#v}" --format '{{json .Manifest}}' | jq -r .digest)" >> "$GITHUB_OUTPUT"
+
+          # Anonymous pull access, i.e. what users get.
+          ghcr_repo=${GITHUB_REPOSITORY_OWNER,,}/$IMAGE_NAME
+          t=$(curl -fsS "https://ghcr.io/token?scope=repository:$ghcr_repo:pull" | jq -r .token)
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' "https://ghcr.io/v2/$ghcr_repo/manifests/${TAG#v}")
+          [[ $code == 200 ]] && echo "ok  GHCR anonymous pull" \
+            || echo "::warning::GHCR package is not public (HTTP $code). Make it public: https://github.com/users/$GITHUB_REPOSITORY_OWNER/packages/container/$IMAGE_NAME/settings"
+          if [[ -n $DOCKERHUB_USERNAME ]]; then
+            hub_repo=${DOCKERHUB_USERNAME,,}/$IMAGE_NAME
+            t=$(curl -fsS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$hub_repo:pull" | jq -r .token)
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json' "https://registry-1.docker.io/v2/$hub_repo/manifests/${TAG#v}")
+            [[ $code == 200 ]] && echo "ok  Docker Hub anonymous pull" || echo "::warning::Docker Hub anonymous pull failed (HTTP $code)"
+          fi
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
           LATEST: ${{ needs.check.outputs.latest }}
+          SHA: ${{ needs.prepare.outputs.sha }}
           GHCR: ${{ steps.names.outputs.ghcr }}
           DOCKERHUB: ${{ steps.names.outputs.dockerhub }}
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.verify.outputs.digest }}
         run: |
           set -euo pipefail
-          sha=$(git -C src rev-parse HEAD)
           {
             echo "3x-ui [\`$TAG\`](https://github.com/$UPSTREAM/releases/tag/$TAG) with sponsored content removed."
             echo
-            echo "Upstream commit: [\`${sha:0:8}\`](https://github.com/$UPSTREAM/commit/$sha)"
+            echo "Upstream commit: [\`${SHA:0:8}\`](https://github.com/$UPSTREAM/commit/$SHA)"
             echo
             echo '```'
             echo "docker pull $GHCR:${TAG#v}"
@@ -238,13 +396,13 @@ jobs:
             echo
             echo "Digest: \`$DIGEST\`"
             echo
-            echo "Platforms: \`$PLATFORMS\`"
+            echo "Platforms: \`linux/amd64, linux/arm64, linux/arm/v7, linux/arm/v6, linux/386\` (each smoke-tested on its own architecture)"
             echo
             echo "The exact source changes are attached as \`nosponsor-$TAG.diff\`."
-            [[ ! -f watch.md ]] || { echo; cat watch.md; }
+            [[ ! -f prepared/watch.md ]] || { echo; cat prepared/watch.md; }
           } > notes.md
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" "nosponsor-$TAG.diff" \
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "prepared/nosponsor-$TAG.diff" -R "$GITHUB_REPOSITORY" \
             --title "3x-ui $TAG (no sponsors)" \
             --notes-file notes.md \
             --target "$GITHUB_SHA" \

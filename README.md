@@ -2,7 +2,7 @@
 
 Docker images of [3x-ui](https://github.com/MHSanaei/3x-ui) with the sponsored content removed. Everything else is unchanged upstream code.
 
-A scheduled GitHub Action checks for a new upstream release every 3 hours. When it finds one, it applies [`remove-sponsors.py`](remove-sponsors.py), builds upstream's own `Dockerfile`, tests the image, then publishes it and creates a matching [release](../../releases).
+A scheduled GitHub Action checks for a new upstream release every 3 hours. When it finds one, it applies [`remove-sponsors.py`](remove-sponsors.py) and builds upstream's own `Dockerfile` for each platform in parallel on a native runner (ARM images on GitHub's ARM runners, no emulation). Each platform's image is tested on its own architecture before anything is tagged. Then the images are published and a matching [release](../../releases) is created.
 
 ## Usage
 
@@ -38,7 +38,8 @@ Each build is checked before it is published:
 
 - The script **fails the build** if upstream changes something it can't recognise. A release is skipped rather than shipped with ads.
 - The DNS guard has its own tests, which run in the workflow.
-- The built image is started. `/sponsors` must return an empty list, and the compiled binary must contain no `sanaei.dev` hosts except the Docs and Donate links.
+- Every platform's image is pulled back by digest and started on its own architecture. `/sponsors` must return an empty list, and the compiled binary must contain no `sanaei.dev` hosts except the Docs and Donate links.
+- Nothing is tagged until all platforms pass. After tagging, every tag is checked for all 5 platforms, and both registries are checked for anonymous pull access.
 - Upstream commits and files since the previous release that mention sponsors, ads, promos or banners are listed in the job summary and the release notes for a human to review.
 
 The exact source diff of each build is attached to its release as `nosponsor-<version>.diff`.

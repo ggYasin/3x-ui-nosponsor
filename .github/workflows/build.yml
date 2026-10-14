@@ -161,16 +161,16 @@ jobs:
       - name: Smoke test
         run: |
           set -euo pipefail
-          docker run -d --name t -p 2053:2053 nosponsor-test
+          docker run -d --name nosponsor-smoke -p 2053:2053 nosponsor-test
           for i in $(seq 60); do
             body=$(curl -fsS http://127.0.0.1:2053/sponsors 2>/dev/null) && break
             sleep 2
           done
-          docker logs t | tail -20
+          docker logs nosponsor-smoke | tail -20
           echo "GET /sponsors -> ${body:-<no response>}"
           echo "$body" | jq -e '.success == true and (.obj.sponsors | length) == 0'
           curl -fsS -o /dev/null http://127.0.0.1:2053/ && echo "panel login page OK"
-          docker rm -f t
+          docker rm -f nosponsor-smoke
 
       # The frontend is embedded in the binary, so this covers backend and UI.
       - name: Scan binary for blocked domains

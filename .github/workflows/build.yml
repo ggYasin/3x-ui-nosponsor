@@ -249,8 +249,11 @@ jobs:
             org.opencontainers.image.version=${{ env.TAG }}
 
       # Pushed untagged; nothing is visible under a tag until every platform passes.
+      # Upstream's Dockerfile downloads Go modules, Xray and geo files during the build;
+      # one automatic retry keeps a network blip from blocking an unattended release.
       - name: Build and push by digest
-        id: push
+        id: push1
+        continue-on-error: true
         uses: docker/build-push-action@v7
         with:
           context: src
@@ -262,6 +265,22 @@ jobs:
           # No build cache: upstream's Dockerfile copies the whole source before `go build`,
           # so each new release invalidates the expensive layers anyway. Exporting a cache
           # would only add an upload to the critical path to save ~1-2 min.
+
+      - name: Build and push by digest (retry)
+        id: push2
+        if: steps.push1.outcome == 'failure'
+        uses: docker/build-push-action@v7
+        with:
+          context: src
+          platforms: ${{ env.PLATFORM }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,"name=${{ steps.prep.outputs.names }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+
+      - name: Image digest
+        id: push
+        run: echo "digest=${{ steps.push1.outputs.digest || steps.push2.outputs.digest }}" >> "$GITHUB_OUTPUT"
 
       # Test the exact bytes that were pushed, on this platform.
       - name: Smoke test
@@ -301,6 +320,7 @@ jobs:
           docker run --rm --platform "$PLATFORM" -v "$PWD/src:/src" -w /src \
             -e CGO_ENABLED=1 -e CGO_CFLAGS=-D_LARGEFILE64_SOURCE "$go_img" sh -euc '
               apk add --no-cache build-base >/dev/null
+              for i in 1 2 3 4 5; do go mod download && break; echo "go mod download failed, retrying"; sleep 15; done
               go build -buildvcs=false -ldflags "-w -s -linkmode external -extldflags -static" -o xui-release .'
           sudo chown "$(id -u):$(id -g)" src/xui-release
           file src/xui-release

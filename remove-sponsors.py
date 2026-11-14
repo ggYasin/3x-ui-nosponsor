@@ -159,14 +159,26 @@ def drop(rel, pattern, what):
     log("WARN" if problem else "ok", f"{rel}: " + (problem or f"{what} removed"))
 
 
-def known_frontend():
-    drop("frontend/src/routes.tsx", r"^.*\bSponsorsPage\b.*\n", "Sponsors route")
-    drop("frontend/src/layouts/AppSidebar.tsx", r"^.*key: '/sponsors'.*\n", "Sponsors menu item")
-    rel = "frontend/src/components/command-palette/CommandPalette.tsx"
-    drop(rel, r"\n[ \t]*\{[^{}]*path: '/sponsors',[^{}]*\},", "Sponsors palette entry")
+def drop_unused_icon(rel):
     p = root / rel
     if p.exists() and p.read_text().count("CrownOutlined") == 1:  # only the import left
         rewrite(p, lambda s: (re.sub(r"^[ \t]*CrownOutlined,\n", "", s, flags=re.M), None))
+
+
+def known_frontend():
+    palette = "frontend/src/components/command-palette/CommandPalette.tsx"
+    table = "frontend/src/routes/panelRoutes.tsx"
+    if (root / table).exists():
+        # v3.11.0+: the router, sidebar, page titles and command palette all read this one list.
+        drop(table, r"^.*\bSponsorsPage\b.*\n", "Sponsors page (route, menu item, palette entry)")
+        drop_unused_icon(table)
+        drop(palette, r"^[ \t]*'/sponsors':.*\n", "Sponsors palette keywords")
+        return
+    # Up to v3.10.x: each of them had its own entry.
+    drop("frontend/src/routes.tsx", r"^.*\bSponsorsPage\b.*\n", "Sponsors route")
+    drop("frontend/src/layouts/AppSidebar.tsx", r"^.*key: '/sponsors'.*\n", "Sponsors menu item")
+    drop(palette, r"\n[ \t]*\{[^{}]*path: '/sponsors',[^{}]*\},", "Sponsors palette entry")
+    drop_unused_icon(palette)
 
 
 # --- 5. Updates come from this repo ----------------------------------------

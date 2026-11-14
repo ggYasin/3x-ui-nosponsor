@@ -99,9 +99,14 @@ jobs:
         run: |
           set -o pipefail
           { echo '### Sponsor removal'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          python3 remove-sponsors.py src --repo "$GITHUB_REPOSITORY" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 remove-sponsors.py src --repo "$GITHUB_REPOSITORY" | tee removal.log | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           mkdir -p out
+          # Not fatal (the ads themselves are gone), but something like an empty menu entry is left over.
+          if grep -q '^WARN' removal.log; then
+            sed -n 's/^WARN  */::warning title=Sponsor removal incomplete::/p' removal.log
+            { echo "### ⚠️ remove-sponsors.py could not apply everything"; echo '```'; grep '^WARN' removal.log; echo '```'; } > out/removal-warnings.md
+          fi
           git -C src add -A
           git -C src diff --cached > "out/nosponsor-$TAG.diff"
           git -C src diff --cached --stat
@@ -575,6 +580,7 @@ jobs:
             echo "Platforms: \`amd64, arm64, armv7, armv6, 386\`, each built and smoke-tested natively on its own architecture."
             echo
             echo "The exact source changes are attached as \`nosponsor-$TAG.diff\`."
+            [[ ! -f prepared/removal-warnings.md ]] || { echo; cat prepared/removal-warnings.md; }
             [[ ! -f prepared/watch.md ]] || { echo; cat prepared/watch.md; }
           } > notes.md
           gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
